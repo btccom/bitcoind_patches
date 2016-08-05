@@ -1,0 +1,130 @@
+diff -Naur bitcoin-0.12.1/src/init.cpp bitcoin-0.12.1-mempoolblacklist/src/init.cpp
+--- bitcoin-0.12.1/src/init.cpp	2016-04-11 19:01:43.000000000 +0800
++++ bitcoin-0.12.1-mempoolblacklist/src/init.cpp	2016-08-06 05:53:07.000000000 +0800
+@@ -11,6 +11,7 @@
+ 
+ #include "addrman.h"
+ #include "amount.h"
++#include "base58.h"
+ #include "chain.h"
+ #include "chainparams.h"
+ #include "checkpoints.h"
+@@ -392,6 +393,7 @@
+     strUsage += HelpMessageOpt("-whitelistrelay", strprintf(_("Accept relayed transactions received from whitelisted peers even when not relaying transactions (default: %d)"), DEFAULT_WHITELISTRELAY));
+     strUsage += HelpMessageOpt("-whitelistforcerelay", strprintf(_("Force relay of transactions from whitelisted peers even they violate local relay policy (default: %d)"), DEFAULT_WHITELISTFORCERELAY));
+     strUsage += HelpMessageOpt("-maxuploadtarget=<n>", strprintf(_("Tries to keep outbound traffic under the given target (in MiB per 24h), 0 = no limit (default: %d)"), DEFAULT_MAX_UPLOAD_TARGET));
++    strUsage += HelpMessageOpt("-mempoolblacklistaddress=<file>", _("blocklist address file for mempool"));
+ 
+ #ifdef ENABLE_WALLET
+     strUsage += HelpMessageGroup(_("Wallet options:"));
+@@ -1660,7 +1662,22 @@
+     // Generate coins in the background
+     GenerateBitcoins(GetBoolArg("-gen", DEFAULT_GENERATE), GetArg("-genproclimit", DEFAULT_GENERATE_THREADS), chainparams);
+ 
+-    // ********************************************************* Step 12: finished
++
++    // ********************************************************* Step 12: add blacklist address, prevent txs get into mempool
++    if (mapArgs.count("-mempoolblacklistaddress")) {
++        std::ifstream blfile(GetArg("-mempoolblacklistaddress", "").c_str());
++        std::string line;
++        while (std::getline(blfile, line)) {
++            CBitcoinAddress address(line);
++            if (!address.IsValid())
++                continue;
++            CScript scriptPubKey = GetScriptForDestination(address.Get());
++            blacklistScriptPubKeys.insert(scriptPubKey);
++        }
++        LogPrintf("load blacklist address size: %u\n", blacklistScriptPubKeys.size());
++    }
++
++    // ********************************************************* Step 13: finished
+ 
+     SetRPCWarmupFinished();
+     uiInterface.InitMessage(_("Done loading"));
+diff -Naur bitcoin-0.12.1/src/init.h bitcoin-0.12.1-mempoolblacklist/src/init.h
+--- bitcoin-0.12.1/src/init.h	2016-04-11 19:01:43.000000000 +0800
++++ bitcoin-0.12.1-mempoolblacklist/src/init.h	2016-08-05 16:20:53.000000000 +0800
+@@ -6,6 +6,7 @@
+ #ifndef BITCOIN_INIT_H
+ #define BITCOIN_INIT_H
+ 
++#include <fstream>
+ #include <string>
+ 
+ class CScheduler;
+diff -Naur bitcoin-0.12.1/src/main.cpp bitcoin-0.12.1-mempoolblacklist/src/main.cpp
+--- bitcoin-0.12.1/src/main.cpp	2016-04-11 19:01:43.000000000 +0800
++++ bitcoin-0.12.1-mempoolblacklist/src/main.cpp	2016-08-06 05:49:09.000000000 +0800
+@@ -8,6 +8,7 @@
+ #include "addrman.h"
+ #include "alert.h"
+ #include "arith_uint256.h"
++#include "base58.h"
+ #include "chainparams.h"
+ #include "checkpoints.h"
+ #include "checkqueue.h"
+@@ -78,6 +79,8 @@
+ bool fAlerts = DEFAULT_ALERTS;
+ bool fEnableReplacement = DEFAULT_ENABLE_REPLACEMENT;
+ 
++std::set<CScript> blacklistScriptPubKeys;
++
+ /** Fees smaller than this (in satoshi) are considered zero fee (for relaying, mining and transaction creation) */
+ CFeeRate minRelayTxFee = CFeeRate(DEFAULT_MIN_RELAY_TX_FEE);
+ 
+@@ -1002,6 +1005,22 @@
+         state.GetRejectCode());
+ }
+ 
++/** Convert ScriptPubKey to address string */
++std::string ConvertScriptPubKeyToStr(const CScript &scriptPubKey)
++{
++    txnouttype type;
++    vector<CTxDestination> addresses;
++    int nRequired;
++
++    if (!ExtractDestinations(scriptPubKey, type, addresses, nRequired))
++        return "";
++
++    std::string addressStr;
++    BOOST_FOREACH(const CTxDestination& addr, addresses)
++        addressStr.append((addressStr.empty() ? "" : ",") + CBitcoinAddress(addr).ToString());
++    return addressStr;
++}
++
+ bool AcceptToMemoryPoolWorker(CTxMemPool& pool, CValidationState &state, const CTransaction &tx, bool fLimitFree,
+                               bool* pfMissingInputs, bool fOverrideMempoolLimit, bool fRejectAbsurdFee,
+                               std::vector<uint256>& vHashTxnToUncache)
+@@ -1166,6 +1185,19 @@
+             }
+         }
+ 
++        // Check prevout. If it's on blacklist, prevent it into mempool.
++        BOOST_FOREACH(const CTxIn &txin, tx.vin) {
++            const CCoins *coins = view.AccessCoins(txin.prevout.hash);
++            if (txin.prevout.n >= coins->vout.size() || coins->vout[txin.prevout.n].IsNull())
++                continue;
++            if (blacklistScriptPubKeys.count(coins->vout[txin.prevout.n].scriptPubKey) != 0) {
++                std::string addrStr = ConvertScriptPubKeyToStr(coins->vout[txin.prevout.n].scriptPubKey);
++                return state.DoS(0, error("AcceptToMemoryPool: blacklist address found in tx: %s, %s",
++                                          hash.ToString(), addrStr),
++                                 REJECT_INVALID, "blacklist address");
++            }
++        }
++
+         CTxMemPoolEntry entry(tx, nFees, GetTime(), dPriority, chainActive.Height(), pool.HasNoInputsOf(tx), inChainInputValue, fSpendsCoinbase, nSigOps, lp);
+         unsigned int nSize = entry.GetTxSize();
+ 
+diff -Naur bitcoin-0.12.1/src/main.h bitcoin-0.12.1-mempoolblacklist/src/main.h
+--- bitcoin-0.12.1/src/main.h	2016-04-11 19:01:43.000000000 +0800
++++ bitcoin-0.12.1-mempoolblacklist/src/main.h	2016-08-05 16:57:59.000000000 +0800
+@@ -149,6 +149,9 @@
+ extern bool fAlerts;
+ extern bool fEnableReplacement;
+ 
++// Blacklist address, prevent txs into mempool which come from these address
++extern std::set<CScript> blacklistScriptPubKeys;
++
+ /** Best header we've seen so far (used for getheaders queries' starting points). */
+ extern CBlockIndex *pindexBestHeader;
+ 
